@@ -12,13 +12,13 @@ use Symplify\RuleDocGenerator\ValueObject\RuleDefinition;
 
 final class ExtractTemplateVariablesRector extends AbstractRector
 {
-    /** @var array<string, array<string, array<array{file: string, line: int}>>> */
+    /** @var array<string, array{type: string, description: string, contexts: array<array{file: string, line: int, template: string}>}> */
     private static array $extractedVariables = [];
     private static bool $shutdownRegistered = false;
 
     public function getRuleDefinition(): RuleDefinition
     {
-        return new RuleDefinition('Extract template variables from Renderer::replaceMacros() calls with context', [
+        return new RuleDefinition('Extract template variables from Renderer::replaceMacros() calls with context, type, and description', [
             new CodeSample('', ''),
         ]);
     }
@@ -85,11 +85,36 @@ final class ExtractTemplateVariablesRector extends AbstractRector
             foreach ($varsArg->items as $item) {
                 if ($item !== null && $item->key instanceof \PhpParser\Node\Scalar\String_) {
                     $varName = $item->key->value;
+                    $varValue = $item->value;
+
                     if (!isset(self::$extractedVariables[$varName])) {
-                        self::$extractedVariables[$varName] = [];
+                        self::$extractedVariables[$varName] = [
+                            'type' => 'Mixed',
+                            'description' => '',
+                            'contexts' => []
+                        ];
                     }
-                    if (!isset(self::$extractedVariables[$varName][$templateName])) {
-                        self::$extractedVariables[$varName][$templateName] = [];
+
+                    // Infer type
+                    $inferredType = 'Mixed';
+                    if ($varValue instanceof \PhpParser\Node\Scalar\String_) {
+                        $inferredType = 'String';
+                    } elseif ($varValue instanceof \PhpParser\Node\Scalar\LNumber) {
+                        $inferredType = 'Integer';
+                    } elseif ($varValue instanceof \PhpParser\Node\Expr\Array_) {
+                        $inferredType = 'Array';
+                    } elseif ($varValue instanceof \PhpParser\Node\Expr\ConstFetch) {
+                        if ($varValue->name !== null && $varValue->name instanceof \PhpParser\Node\Name) {
+                            $constName = strtolower($this->getName($varValue->name));
+                            if ($constName === 'true' || $constName === 'false') {
+                                $inferredType = 'Boolean';
+                            }
+                        }
+                    }
+
+                    // Update type if we have a better one than 'Mixed'
+                    if (self::$extractedVariables[$varName]['type'] === 'Mixed' && $inferredType !== 'Mixed') {
+                        self::$extractedVariables[$varName]['type'] = $inferredType;
                     }
 
                     $file = $this->file ? $this->file->getFilePath() : 'unknown file';
@@ -103,26 +128,29 @@ final class ExtractTemplateVariablesRector extends AbstractRector
 
                     $context = [
                         'file' => $file,
-                        'line' => $line
+                        'line' => $line,
+                        'template' => $templateName
                     ];
 
                     // Check if we already have this context to avoid duplicates
                     $exists = false;
-                    foreach (self::$extractedVariables[$varName][$templateName] as $existingContext) {
-                        if ($existingContext['file'] === $context['file'] && $existingContext['line'] === $context['line']) {
+                    foreach (self::$extractedVariables[$varName]['contexts'] as $existingContext) {
+                        if ($existingContext['file'] === $context['file'] && $existingContext['line'] === $context['line'] && $existingContext['template'] === $context['template']) {
                             $exists = true;
                             break;
                         }
                     }
 
                     if (!$exists) {
-                        self::$extractedVariables[$varName][$templateName][] = $context;
+                        self::$extractedVariables[$varName]['contexts'][] = $context;
                         $foundNew = true;
                     }
                 }
             }
         }
 
+        // This causes issue where each write operation overwrites the previous ones in multiple workers when `--clear-cache` isn't used
+        // so to implement appending in parallel mode: load file -> merge -> save file
         if ($foundNew) {
             self::saveVariables();
         }
@@ -143,106 +171,140 @@ final class ExtractTemplateVariablesRector extends AbstractRector
             mkdir(dirname($filePath), 0777, true);
         }
 
-        $existingVars = [];
+        $existingData = [];
         if (file_exists($filePath)) {
             $content = file_get_contents($filePath);
 
-            // Re-parse existing markdown for context.
-            // This regex tries to find the variables, their templates, and the usage files.
-            // Format:
-            // ### `$varName`
-            //
-            // #### `templateName`
-            // - Used in `file` on line X
+            // Re-parse the generated output to merge multiple process runs
+            // This is brittle but works for this specific requested format
 
-            if (preg_match_all('/### `(.*?)`\n\n(.*?)(?=\n### |\z)/s', $content, $matches)) {
+            if (preg_match_all('/### `(.*?)`\n\n- \*\*Type:\*\* (.*?)\n- \*\*Context:\*\* (.*?)\n\n#### Usages\n(.*?)(?=\n### |\z)/s', $content, $matches)) {
                 foreach ($matches[1] as $index => $varName) {
-                    $existingVars[$varName] = [];
-                    $varContent = $matches[2][$index];
+                    $type = $matches[2][$index];
 
-                    if (preg_match_all('/#### (.*?)\n(.*?)(?=\n#### |\z)/s', $varContent, $templateMatches)) {
-                        foreach ($templateMatches[1] as $tIndex => $tName) {
+                    $existingData[$varName] = [
+                        'type' => $type,
+                        'description' => '',
+                        'contexts' => []
+                    ];
+
+                    $usages = $matches[4][$index];
+
+                    if (preg_match_all('/- Used in (.*?) from `(.*?)` on line (\d+)/', $usages, $usageMatches)) {
+                        foreach ($usageMatches[1] as $uIndex => $tName) {
+                            $file = $usageMatches[2][$uIndex];
+                            $line = (int)$usageMatches[3][$uIndex];
                             $tNameClean = trim($tName, '`*');
                             if ($tNameClean === '(dynamic or unknown template)' || strpos($tNameClean, 'dynamic') !== false) {
                                 $tNameClean = '*(dynamic or unknown template)*';
                             }
 
-                            $existingVars[$varName][$tNameClean] = [];
-                            $linesContent = $templateMatches[2][$tIndex];
-
-                            if (preg_match_all('/- Used in `(.*?)` on line (\d+)/', $linesContent, $lineMatches)) {
-                                foreach ($lineMatches[1] as $lIndex => $file) {
-                                    $line = (int)$lineMatches[2][$lIndex];
-                                    $existingVars[$varName][$tNameClean][] = [
-                                        'file' => $file,
-                                        'line' => $line
-                                    ];
-                                }
-                            }
+                            $existingData[$varName]['contexts'][] = [
+                                'file' => $file,
+                                'line' => $line,
+                                'template' => $tNameClean
+                            ];
                         }
                     }
                 }
             }
         }
 
-        // Merge new variables with existing ones
-        foreach (self::$extractedVariables as $varName => $templates) {
-            if (!isset($existingVars[$varName])) {
-                $existingVars[$varName] = [];
+        // Merge memory data with existing data
+        foreach (self::$extractedVariables as $varName => $info) {
+            if (!isset($existingData[$varName])) {
+                $existingData[$varName] = [
+                    'type' => 'Mixed',
+                    'description' => '',
+                    'contexts' => []
+                ];
             }
-            foreach ($templates as $template => $contexts) {
-                $cleanTemplate = trim($template, '`*');
-                if ($cleanTemplate === 'unknown' || strpos($cleanTemplate, 'dynamic') !== false) {
-                    $cleanTemplate = '*(dynamic or unknown template)*';
-                }
 
-                if (!isset($existingVars[$varName][$cleanTemplate])) {
-                    $existingVars[$varName][$cleanTemplate] = [];
-                }
+            if ($existingData[$varName]['type'] === 'Mixed' && $info['type'] !== 'Mixed') {
+                $existingData[$varName]['type'] = $info['type'];
+            }
 
-                foreach ($contexts as $context) {
-                    $exists = false;
-                    foreach ($existingVars[$varName][$cleanTemplate] as $existingContext) {
-                        if ($existingContext['file'] === $context['file'] && $existingContext['line'] === $context['line']) {
-                            $exists = true;
-                            break;
-                        }
+            foreach ($info['contexts'] as $ctx) {
+                $exists = false;
+                foreach ($existingData[$varName]['contexts'] as $eCtx) {
+                    if ($eCtx['file'] === $ctx['file'] && $eCtx['line'] === $ctx['line'] && $eCtx['template'] === $ctx['template']) {
+                        $exists = true;
+                        break;
                     }
-                    if (!$exists) {
-                        $existingVars[$varName][$cleanTemplate][] = $context;
-                    }
+                }
+                if (!$exists) {
+                    $existingData[$varName]['contexts'][] = $ctx;
                 }
             }
         }
+
+        ksort($existingData);
 
         // Generate markdown
-        $newContent = "# Template Variables Context Example\n\nThis file documents all variables used in `Renderer::replaceMacros()` and the templates they are used in, including their source code usage locations.\n\n";
+        $newContent = "---
+Note: This document was initially generated by Jules, an AI assistant, based on code analysis of the Friendica project. It has been reviewed and may be further updated by the Friendica community.
+---
 
-        ksort($existingVars);
-        foreach ($existingVars as $varName => $templates) {
+# Friendica Template Variables
+
+## Introduction
+
+Friendica utilizes the Smarty templating engine for rendering its user interface. Templates are typically `.tpl` files located in the `view/templates/` directory and within specific theme directories (e.g., `view/theme/frio/tpl/`).
+
+Variables are passed from PHP controller logic to these Smarty templates. This is primarily handled by the `Friendica\Core\Renderer::replaceMacros()` method, which takes a template string and an associative array of variables to substitute.
+
+In Smarty templates (`.tpl` files), variables are accessed using Smarty's syntax, such as `{\$variable}` for simple variables or `{\$array.key}` for elements within arrays/objects. The PHP code passes an associative array of data to the template engine, and the keys of this array become the top-level template variables.
+
+This document aims to catalog commonly used variables available in Friendica templates.
+
+**Note on Localization**: Many textual variables are localized in PHP using Friendica's internationalization system (e.g., `DI::l10n()->t()`) before being passed to templates. The 'Localized: Yes' note indicates that the string content is subject to translation.
+
+## Extracted Variables
+
+";
+
+        foreach ($existingData as $varName => $info) {
             $newContent .= "### `$varName`\n\n";
-            ksort($templates);
-            foreach ($templates as $template => $contexts) {
-                if ($template === '*(dynamic or unknown template)*') {
-                    $cleanTemplate = $template;
+            $newContent .= "- **Type:** {$info['type']}\n";
+
+            // Collect unique templates for the context summary
+            $templates = [];
+            foreach ($info['contexts'] as $ctx) {
+                $cleanTpl = trim($ctx['template'], '`*');
+                if ($cleanTpl === 'unknown' || strpos($cleanTpl, 'dynamic') !== false) {
+                    $cleanTpl = '*(dynamic or unknown template)*';
                 } else {
-                    $cleanTemplate = "`$template`";
+                    $cleanTpl = "`$cleanTpl`";
                 }
-                $newContent .= "#### $cleanTemplate\n";
-
-                // Sort contexts by file and then by line
-                usort($contexts, function($a, $b) {
-                    if ($a['file'] === $b['file']) {
-                        return $a['line'] <=> $b['line'];
-                    }
-                    return $a['file'] <=> $b['file'];
-                });
-
-                foreach ($contexts as $context) {
-                    $newContent .= "- Used in `{$context['file']}` on line {$context['line']}\n";
+                if (!in_array($cleanTpl, $templates)) {
+                    $templates[] = $cleanTpl;
                 }
-                $newContent .= "\n";
             }
+            sort($templates);
+            $templateList = implode(', ', $templates);
+
+            $newContent .= "- **Context:** $templateList\n\n";
+
+            $newContent .= "#### Usages\n";
+
+            // Sort contexts
+            usort($info['contexts'], function($a, $b) {
+                if ($a['file'] === $b['file']) {
+                    return $a['line'] <=> $b['line'];
+                }
+                return $a['file'] <=> $b['file'];
+            });
+
+            foreach ($info['contexts'] as $ctx) {
+                $cleanTpl = trim($ctx['template'], '`*');
+                if ($cleanTpl === 'unknown' || strpos($cleanTpl, 'dynamic') !== false) {
+                    $cleanTpl = '*(dynamic or unknown template)*';
+                } else {
+                    $cleanTpl = "`$cleanTpl`";
+                }
+                $newContent .= "- Used in $cleanTpl from `{$ctx['file']}` on line {$ctx['line']}\n";
+            }
+            $newContent .= "\n";
         }
 
         file_put_contents($filePath, $newContent);
