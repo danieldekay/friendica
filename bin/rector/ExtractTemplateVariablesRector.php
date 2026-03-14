@@ -99,7 +99,7 @@ final class ExtractTemplateVariablesRector extends AbstractRector
             return;
         }
 
-        $filePath = __DIR__ . '/../../doc/TemplateVariables.md';
+        $filePath = __DIR__ . '/../../doc/TemplateVariables.template.md';
 
         // Ensure doc directory exists
         if (!is_dir(dirname($filePath))) {
