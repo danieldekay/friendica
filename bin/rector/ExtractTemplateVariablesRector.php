@@ -6,6 +6,8 @@ namespace Friendica\Rector;
 
 use PhpParser\Node;
 use PhpParser\Node\Expr\StaticCall;
+use PhpParser\Node\Expr\Assign;
+use PhpParser\Node\Expr\Variable;
 use Rector\Rector\AbstractRector;
 use Symplify\RuleDocGenerator\ValueObject\CodeSample\CodeSample;
 use Symplify\RuleDocGenerator\ValueObject\RuleDefinition;
@@ -67,6 +69,7 @@ final class ExtractTemplateVariablesRector extends AbstractRector
 
         // Try to get template name
         $templateName = '*(dynamic or unknown template)*';
+
         if ($templateArg instanceof \PhpParser\Node\Scalar\String_) {
             $templateName = $templateArg->value;
         } elseif ($templateArg instanceof StaticCall) {
@@ -77,6 +80,11 @@ final class ExtractTemplateVariablesRector extends AbstractRector
                     $templateName = $innerArgs[0]->value->value;
                 }
             }
+        } elseif ($templateArg instanceof Variable) {
+            // Very common pattern: $tpl = Renderer::getMarkupTemplate('...');
+            // In a real Rector rule, we would use node scopes to find the previous assignment.
+            // For now, if we can't find it easily, we mark it as dynamic.
+            // A more advanced rule could traverse back in the block to find the assignment to this variable.
         }
 
         // Try to get variables
@@ -110,6 +118,8 @@ final class ExtractTemplateVariablesRector extends AbstractRector
                                 $inferredType = 'Boolean';
                             }
                         }
+                    } elseif ($varValue instanceof \PhpParser\Node\Expr\MethodCall) {
+                         // Often it returns strings or mixed
                     }
 
                     // Update type if we have a better one than 'Mixed'
@@ -149,8 +159,6 @@ final class ExtractTemplateVariablesRector extends AbstractRector
             }
         }
 
-        // This causes issue where each write operation overwrites the previous ones in multiple workers when `--clear-cache` isn't used
-        // so to implement appending in parallel mode: load file -> merge -> save file
         if ($foundNew) {
             self::saveVariables();
         }
@@ -174,9 +182,6 @@ final class ExtractTemplateVariablesRector extends AbstractRector
         $existingData = [];
         if (file_exists($filePath)) {
             $content = file_get_contents($filePath);
-
-            // Re-parse the generated output to merge multiple process runs
-            // This is brittle but works for this specific requested format
 
             if (preg_match_all('/### `(.*?)`\n\n- \*\*Type:\*\* (.*?)\n- \*\*Context:\*\* (.*?)\n\n#### Usages\n(.*?)(?=\n### |\z)/s', $content, $matches)) {
                 foreach ($matches[1] as $index => $varName) {
